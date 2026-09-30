@@ -1,0 +1,514 @@
+'''H3 attention forward with negotiated projected-QKV fallback.'''
+
+import comfy.ldm.minimax.model as h3_model
+import comfy.model_management
+import comfy.quant_ops
+
+from . import diagnostics
+from .attention import AttentionBackendUnavailable
+from .external_consumer import (
+    consume_streamed_h3_qkv,
+    get_streamed_h3_qkv_consumer,
+)
+from .normalized_rows import (
+    NORM1_SOURCE_KEY,
+    NormalizedRowsUnsupported,
+    attention_output_buffer,
+)
+from .ordering_probe import has_ordering_observer, observe_attention
+
+
+DENSE_KITCHEN_PREQUANTIZED = 'comfy_kitchen_int8_prequantized'
+
+
+class _AttentionOutProjectionProxy:
+    def __init__(self, module, out_proj):
+        self._module = module
+        self.out_proj = out_proj
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+
+def _project_attention_output(module, out, out_projection):
+    if out_projection is None:
+        return module.out_proj(out)
+    return out_projection.linear(out)
+
+
+def finish_qkv_projection(module, projected, rope_freqs):
+    seq = projected.shape[0]
+    inner = module.heads * module.head_dim
+    q, k, v = projected.split(inner, dim=-1)
+    v = v.view(seq, module.heads, module.head_dim)
+
+    if rope_freqs is not None:
+        if comfy.model_management.in_training:
+            raise RuntimeError('H3 optimized attention is inference-only')
+        q = q.view(1, seq, module.heads, module.head_dim)
+        k = k.view(1, seq, module.heads, module.head_dim)
+        qw = comfy.model_management.cast_to(
+            module.q_norm.weight,
+            device=projected.device,
+        )
+        kw = comfy.model_management.cast_to(
+            module.k_norm.weight,
+            device=projected.device,
+        )
+        rot = rope_freqs.shape[-3] * 2
+        comfy.quant_ops.ck.rms_rope_split_half_(
+            q,
+            k,
+            rope_freqs,
+            qw,
+            kw,
+            epsilon=module.q_norm.eps,
+            rot_dim=rot,
+        )
+        q = q[0]
+        k = k[0]
+    else:
+        q = module.q_norm(
+            q.view(seq, module.heads, module.head_dim)
+        )
+        k = module.k_norm(
+            k.view(seq, module.heads, module.head_dim)
+        )
+    return q, k, v
+
+
+def project_qkv(module, x, rope_freqs):
+    with diagnostics.stage('qkv_linear'):
+        projected = module.qkv_proj(x)
+    with diagnostics.stage('qk_norm_rope'):
+        return finish_qkv_projection(module, projected, rope_freqs)
+
+
+def to_hnd(q, k, v):
+    return (
+        q.transpose(0, 1).unsqueeze(0),
+        k.transpose(0, 1).unsqueeze(0),
+        v.transpose(0, 1).unsqueeze(0),
+    )
+
+
+def _legacy_attention(module, q, k, v, transformer_options, attention=None):
+    attention_fn = (
+        attention if attention is not None else h3_model.optimized_attention
+    )
+    return attention_fn(
+        q,
+        k,
+        v,
+        module.heads,
+        mask=None,
+        skip_reshape=True,
+        skip_output_reshape=True,
+        transformer_options=transformer_options,
+    )
+
+
+def _project_or_none(
+    projector,
+    module,
+    x,
+    rope_freqs,
+    *,
+    layer_index,
+    transformer_options,
+):
+    callback = getattr(projector, 'try_project', None)
+    if callback is None:
+        callback = projector.project
+    return callback(
+        module,
+        x,
+        rope_freqs,
+        layer_index=layer_index,
+        transformer_options=transformer_options,
+    )
+
+
+def _materialize_norm1_source(x, norm1_source):
+    return norm1_source.materialize() if norm1_source is not None else x
+
+
+def flatten_attention_output(module, out, source):
+    """Reach [batch, sequence, heads * head_dim] from whatever the kernel wrote.
+
+    An ``nhd`` kernel output already has sequence ahead of heads, so the
+    flatten is a view. An ``hnd`` output needs a transpose whose last two
+    dimensions cannot merge, so ``reshape`` copies a second full-sequence BF16
+    tensor -- at the production shape that is the single largest avoidable
+    allocation in the block.
+    """
+    if out.ndim != 4:
+        raise RuntimeError(
+            '%s returned rank-%d output; expected HND rank 4'
+            % (source, out.ndim)
+        )
+    # One expression for both storage layouts. Over head-major storage the
+    # dimensions cannot merge and `reshape` copies; over sequence-major
+    # storage the transpose lands on contiguous memory and this is a view.
+    return out.transpose(1, 2).reshape(
+        out.shape[0], out.shape[2], module.heads * module.head_dim
+    )
+
+
+def _finish_projected(module, backend, prepared, out_projection=None):
+    # A streamed backend may own the full attention -> out_proj lifetime and
+    # return the final hidden-size tensor directly. This is deliberately
+    # opt-in so Kitchen, Triton, BF16 and legacy projected contracts stay put.
+    execute_projected = getattr(backend, 'execute_projected', None)
+    if execute_projected is not None:
+        execution_module = (
+            module
+            if out_projection is None
+            else _AttentionOutProjectionProxy(
+                module,
+                out_projection.linear,
+            )
+        )
+        direct = execute_projected(execution_module, prepared)
+        if direct is not None:
+            if direct.ndim != 2:
+                raise RuntimeError(
+                    '%s returned rank-%d direct projected output; expected rank 2'
+                    % (
+                        getattr(backend, 'name', type(backend).__name__),
+                        direct.ndim,
+                    )
+                )
+            return direct
+
+    name = getattr(backend, 'name', type(backend).__name__)
+    raw = backend.execute(prepared)
+    out = flatten_attention_output(module, raw, name)
+    # Only the flattened view is needed from here. Under `hnd` the reshape
+    # already copied, so this returns a full-sequence buffer to the allocator
+    # before the projection asks for one; under `nhd` `out` aliases `raw` and
+    # this is a no-op.
+    del raw
+    if getattr(backend, 'release_carrier_before_out_proj', False):
+        release = getattr(prepared, 'release', None)
+        if release is None:
+            raise RuntimeError(
+                '%s asked to release its carrier but %s cannot release one'
+                % (name, type(prepared).__name__)
+            )
+        release()
+    with diagnostics.stage('attention_out'):
+        return _project_attention_output(
+            module,
+            out.squeeze(0),
+            out_projection,
+        )
+
+
+def _finish_bf16_projected(
+    module,
+    backend,
+    projected,
+    *,
+    layer_index,
+    transformer_options,
+    out_projection=None,
+):
+    """Consume chunked/native BF16 QKV without running QKV projection again."""
+    q, k, v = projected.q, projected.k, projected.v
+    backend_name = getattr(backend, 'name', None)
+
+    # The dense Kitchen backend object exists here only because that is the
+    # package-owned projector slot used by Memory Optimization. Preserve
+    # precision must not force Kitchen attention: feed the already-projected
+    # BF16 tensors to whatever attention Comfy/upstream currently selected.
+    if backend is None or backend_name == DENSE_KITCHEN_PREQUANTIZED:
+        raw = _legacy_attention(
+            module,
+            q,
+            k,
+            v,
+            transformer_options,
+        )
+        source = 'existing_attention_bf16'
+    else:
+        prepared = backend.prepare(
+            q,
+            k,
+            v,
+            layer_index=layer_index,
+            transformer_options=transformer_options,
+        )
+        try:
+            raw = backend.execute(prepared)
+        finally:
+            del prepared
+        source = backend_name or type(backend).__name__
+
+    # The backend launch has consumed the BF16 inputs. Dropping the wrapper
+    # here lets the stream-ordered allocator reclaim them before out_proj.
+    del projected, q, k, v
+    out = flatten_attention_output(module, raw, source)
+    del raw
+    with diagnostics.stage('attention_out'):
+        return _project_attention_output(
+            module,
+            out.squeeze(0),
+            out_projection,
+        )
+
+
+def _finish_streamed_dense_bf16_projected(
+    module,
+    projected,
+    *,
+    layer_index,
+    transformer_options,
+    out_projection=None,
+):
+    """Consume Q slabs against complete BF16 K/V and project each output slab."""
+    output = attention_output_buffer(projected.x)
+    external_consumer = get_streamed_h3_qkv_consumer(transformer_options)
+    try:
+        for start, end, q in projected.stream_q():
+            if external_consumer is None:
+                raw = _legacy_attention(
+                    module,
+                    q,
+                    projected.k,
+                    projected.v,
+                    transformer_options,
+                )
+            else:
+                raw = consume_streamed_h3_qkv(
+                    external_consumer,
+                    q,
+                    projected.k,
+                    projected.v,
+                    q_start=start,
+                    q_total=projected.sequence,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+            out = flatten_attention_output(
+                module,
+                raw,
+                'streamed_dense_bf16',
+            )
+            del raw
+            with diagnostics.stage('attention_out'):
+                output[start:end].copy_(
+                    _project_attention_output(
+                        module,
+                        out.squeeze(0),
+                        out_projection,
+                    )
+                )
+            del q, out
+        return output
+    finally:
+        projected.release()
+
+
+def make_forward(
+    module,
+    layer_index,
+    backend=None,
+    attention=None,
+    projector=None,
+    fallback_forward=None,
+    backend_fallback_to_dense=False,
+    force_out_proj_int8=False,
+):
+    if backend is not None and attention is not None:
+        raise ValueError('pass either backend or attention, not both')
+    if projector is not None and backend is None:
+        raise ValueError('a fused QKV projector requires a consuming backend')
+    bind_projector = getattr(projector, 'bind', None)
+    if bind_projector is not None:
+        bind_projector(module)
+
+    def forward(x, rope_freqs=None, transformer_options=None):
+        if force_out_proj_int8:
+            from .qkv.int8 import LazyConvRotINT8Linear
+
+        out_projection = (
+            LazyConvRotINT8Linear(module.out_proj)
+            if force_out_proj_int8
+            else None
+        )
+        try:
+            with diagnostics.stage('attention_total'):
+                return _forward(
+                    x,
+                    rope_freqs,
+                    transformer_options,
+                    out_projection,
+                )
+        finally:
+            if out_projection is not None:
+                out_projection.release()
+
+    def _forward(x, rope_freqs, transformer_options, out_projection):
+        transformer_options = (
+            transformer_options if transformer_options is not None else {}
+        )
+        norm1_source = transformer_options.get(NORM1_SOURCE_KEY)
+        if norm1_source is not None:
+            # The lazy source is an implementation detail of our QKV projector.
+            # Do not leak it to attention backends, observers, or foreign hooks.
+            transformer_options = transformer_options.copy()
+            transformer_options.pop(NORM1_SOURCE_KEY, None)
+
+        ordering_probe = has_ordering_observer(transformer_options)
+        if projector is not None and not ordering_probe:
+            projection_input = norm1_source if norm1_source is not None else x
+            try:
+                projected = _project_or_none(
+                    projector,
+                    module,
+                    projection_input,
+                    rope_freqs,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+            except NormalizedRowsUnsupported:
+                if norm1_source is None:
+                    raise
+                # A projector may still require a concrete tensor for one
+                # internal operation. Materialize only at this boundary and
+                # retry the same optimized QKV route rather than exposing the
+                # lazy row object to the rest of attention.
+                projection_input = norm1_source.materialize()
+                projected = _project_or_none(
+                    projector,
+                    module,
+                    projection_input,
+                    rope_freqs,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+            if projected is not None:
+                from .qkv.bf16 import (
+                    PreparedBF16QKV,
+                    PreparedStreamedDenseBF16QKV,
+                )
+
+                if isinstance(projected, PreparedStreamedDenseBF16QKV):
+                    return _finish_streamed_dense_bf16_projected(
+                        module,
+                        projected,
+                        layer_index=layer_index,
+                        transformer_options=transformer_options,
+                        out_projection=out_projection,
+                    )
+
+                if isinstance(projected, PreparedBF16QKV):
+                    return _finish_bf16_projected(
+                        module,
+                        backend,
+                        projected,
+                        layer_index=layer_index,
+                        transformer_options=transformer_options,
+                        out_projection=out_projection,
+                    )
+                prepared = backend.prepare_projected(
+                    projected,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+                del projected
+                try:
+                    return _finish_projected(
+                        module,
+                        backend,
+                        prepared,
+                        out_projection,
+                    )
+                finally:
+                    del prepared
+            if fallback_forward is not None:
+                return fallback_forward(
+                    _materialize_norm1_source(x, norm1_source),
+                    rope_freqs=rope_freqs,
+                    transformer_options=transformer_options,
+                )
+
+        qkv_input = _materialize_norm1_source(x, norm1_source)
+        q, k, v = project_qkv(module, qkv_input, rope_freqs)
+        q, k, v = to_hnd(q, k, v)
+        if ordering_probe:
+            observe_attention(
+                layer_index,
+                transformer_options,
+                q,
+                k,
+                v,
+            )
+        if backend is None:
+            out = _legacy_attention(
+                module,
+                q,
+                k,
+                v,
+                transformer_options,
+                attention=attention,
+            )
+        else:
+            fallback_inputs_available = True
+            try:
+                prepared = backend.prepare(
+                    q,
+                    k,
+                    v,
+                    layer_index=layer_index,
+                    transformer_options=transformer_options,
+                )
+                retain_fallback_inputs = (
+                    backend_fallback_to_dense
+                    and backend.requires_fallback_inputs(prepared)
+                )
+                if not retain_fallback_inputs:
+                    del q, k, v
+                    fallback_inputs_available = False
+                try:
+                    out_hnd = backend.execute(prepared)
+                finally:
+                    del prepared
+            except AttentionBackendUnavailable:
+                if (
+                    not backend_fallback_to_dense
+                    or not fallback_inputs_available
+                ):
+                    raise
+                v = v.contiguous()
+                out_hnd = _legacy_attention(
+                    module,
+                    q,
+                    k,
+                    v,
+                    transformer_options,
+                )
+            out = flatten_attention_output(
+                module,
+                out_hnd,
+                getattr(backend, 'name', type(backend).__name__),
+            )
+            del out_hnd
+
+        with diagnostics.stage('attention_out'):
+            return _project_attention_output(
+                module,
+                out.squeeze(0),
+                out_projection,
+            )
+
+    forward._h3_sparse_dan_core_attention = True
+    forward._h3_sparse_dan_core_layer_index = int(layer_index)
+    forward._h3_sparse_dan_core_backend = getattr(backend, 'name', None)
+    forward._h3_sparse_dan_core_projector = getattr(projector, 'name', None)
+    forward._h3_sparse_dan_core_lazy_norm_source = projector is not None
+    forward._h3_sparse_dan_core_force_out_proj_int8 = bool(
+        force_out_proj_int8
+    )
+    return forward
