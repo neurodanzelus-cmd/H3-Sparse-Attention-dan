@@ -159,11 +159,16 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     options=list(SPARSE_BACKEND_PUBLIC_REQUESTS),
                     default=SPARSE_BACKEND_KITCHEN,
                     tooltip=(
-                        'Kitchen INT8 64Q x 64KV is the quality default. Kitchen INT8 '
-                        '64Q x 128KV uses coarser KV selection and may be faster, but '
-                        'can change output quality. Sparse Sage geometry depends on '
-                        'GPU architecture; other choices use 64Q x 64KV. Explicit '
-                        'choices error when unavailable rather than switching backends.'
+                        'Kitchen INT8 64Q x 64KV (Quality) is the default. '
+                        'Kitchen INT8 64Q x 128KV (Faster) was faster in the '
+                        'measured full-block SM89 comparison, but its coarser '
+                        'KV selections can change output quality and the speed '
+                        'gain is not guaranteed on every GPU. '
+                        'FROST BF16, BF16 Triton, and FP8 FlexAttention use '
+                        '64Q x 64KV routing. Sparse Sage uses 128Q x 64KV on '
+                        'SM80/86/87/89/120 and 64Q x 128KV on SM90. '
+                        'Explicit backend choices fail if that backend is '
+                        'unavailable and do not switch to another backend.'
                     ),
                 ),
                 io.Combo.Input(
