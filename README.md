@@ -12,6 +12,14 @@ The packaged native backends cover Windows x64. No other nodes from either upstr
 
 ## Source
 
-The sparse engine and Advanced settings follow the current H3 Sparse Attention (Advanced) implementation by Zironic, checked 2026-09-30. Its sparse route keeps audio, text, reference context, and mixed boundary tiles dense by default. This node retains a hidden legacy workflow field for old graphs, but always enables that protection and no longer shows a toggle. VSA-trained H3 checkpoints pass through unchanged so their trained sparse route remains intact. The curve editor and workflow-saved profiles are this package's additions.
+Advanced-related updates were synchronized against Zironic/H3-Optimizations **0.2.45**, commit [`8627749`](https://github.com/Zironic/H3-Optimizations/commit/862774944a331bc1a66cee1cf805b94bd138ebbe), checked 2026-10-17:
+
+- Sparse attention can replace recognized KJNodes SageAttention overrides, while preserving other custom attention overrides.
+- The fallback attention path honors newer ComfyUI per-block `comfy_attention` preferences and explicit attention callables.
+- Sparse Sage on SM89 can use the native SA2++ kernel shipped in the updated Windows DLL (`native-v11`, ABI 4). Older compatible libraries retain the existing extension fallback. SpargeAttention's compiled package is still required for the Sparse Sage backend.
+
+Advanced has no new backend choices or input controls in this revision. The curve editor, profiles, step columns, step detection and refresh, curve visibility, and saved curve data are preserved.
+
+The sparse route keeps audio, text, reference context, and mixed boundary tiles dense by default. This node retains a hidden legacy workflow field for old graphs, but always enables that protection and no longer shows a toggle. VSA-trained H3 checkpoints pass through unchanged so their trained sparse route remains intact. The curve editor and workflow-saved profiles are this package's additions. Separate upstream nodes such as VSA Attention, Memory Optimization, and AIMDO Residency Limiter are not registered by this package.
 
 The ComfyUI entry point and Python namespace were changed so this package exposes one node and can coexist with the original H3-Optimizations package.

@@ -750,10 +750,22 @@ function enhanceNode(node) {
     "button",
     "Edit attention curve",
     null,
-    () => openCurveEditor(node, widget, profilesWidget),
+    (value, canvas, _node, _pos, event) => {
+      // Restoring an API prompt calls callbacks with the saved value (null
+      // for this button). Canvas clicks include their context/event; Vue
+      // button clicks pass undefined. Neither should run while configuring.
+      if (app.configuringGraph) return;
+      if (!canvas && !event && value !== undefined) return;
+      openCurveEditor(node, widget, profilesWidget);
+    },
+    // Prompt serialization uses options.serialize, while workflow
+    // serialization uses widget.serialize. Disable both for this UI action.
+    { serialize: false },
   );
   if (button) button.serialize = false;
-  node.setSize?.(node.computeSize?.() ?? node.size);
+  if (!app.configuringGraph) {
+    node.setSize?.(node.computeSize?.() ?? node.size);
+  }
   updateCanvas(node);
 }
 
