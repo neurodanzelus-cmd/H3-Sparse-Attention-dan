@@ -11,7 +11,7 @@ import comfy.model_management
 import comfy.model_prefetch
 from comfy.ldm.minimax import model as minimax
 
-from ..model import get_minimax_h3_model
+from ..model import get_minimax_h3_model, unpatched_model_object
 
 
 FORWARD_KEY = 'diffusion_model._forward'
@@ -19,7 +19,14 @@ OWNER_MARKER = '_h3_sparse_dan_core_embedding_memory'
 SIGNATURE_MARKER = '_h3_sparse_dan_core_embedding_memory_signature'
 ORIGINAL_MARKER = '_h3_sparse_dan_core_embedding_memory_original'
 FALLBACK_REASON_KEY = 'h3_sparse_dan_core_embedding_memory_fallback'
-UPSTREAM_FORWARD_SHA256 = '14bdfccd6860f252005b8d43ab446aa9a938a13dc819061724b8f914218f5fd1'
+# ComfyUI 0.35 added compiler allocation scopes, block attention substitution,
+# the minimax_h3_layout/block_index options, and FinalLayer PDD arguments.
+FORWARD_0_34 = '0.34'
+FORWARD_0_35 = '0.35'
+UPSTREAM_FORWARDS = {
+    '14bdfccd6860f252005b8d43ab446aa9a938a13dc819061724b8f914218f5fd1': FORWARD_0_34,
+    '87484f8a01f09a9f20dc20da8287bd1747aee122b0145281cff531d82ddaa6df': FORWARD_0_35,
+}
 
 
 class H3EmbeddingMemoryPatchError(RuntimeError):
@@ -30,21 +37,41 @@ def _source_digest(forward):
     return hashlib.sha256(inspect.getsource(forward).encode()).hexdigest()
 
 
+def _upstream_releases_embedding(forward):
+    '''True when ComfyUI's own H3 forward already frees the embedding temporaries.
+
+    ComfyUI 0.39.2 moved embedding assembly into ``_embed_and_pack``, whose
+    locals die when it returns, before block 0. Patching that forward would
+    gain nothing.
+    '''
+    if not callable(getattr(minimax.MiniMaxH3Model, '_embed_and_pack', None)):
+        return False
+    try:
+        return 'self._embed_and_pack(' in inspect.getsource(forward)
+    except (OSError, TypeError):
+        return False
+
+
 def _validate_upstream_forward(forward):
+    '''Return the known upstream generation that ``forward`` reproduces.'''
     try:
         digest = _source_digest(forward)
     except (OSError, TypeError) as exc:
         raise H3EmbeddingMemoryPatchError(
             'cannot inspect MiniMax H3 _forward for embedding-memory compatibility'
         ) from exc
-    if digest != UPSTREAM_FORWARD_SHA256:
+    generation = UPSTREAM_FORWARDS.get(digest)
+    if generation is None:
         raise H3EmbeddingMemoryPatchError(
-            'MiniMax H3 _forward changed; refusing the experimental embedding-memory patch'
+            'MiniMax H3 _forward changed; refusing the embedding-memory patch'
         )
+    return generation
 
 
-def make_forward(model, original_forward):
+def make_forward(model, original_forward, generation):
     announced = []
+    current = generation == FORWARD_0_35
+    prefetch_scope = {'malloc_scope': 'block'} if current else {}
 
     def forward(x, timestep, context, transformer_options={}, minimax_payload=None,
                 denoise_mask=None, audio_denoise_mask=None, **kwargs):
@@ -65,6 +92,9 @@ def make_forward(model, original_forward):
             layout = minimax.PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
                                           keyframes=payload.get('keyframes'),
                                           refs=payload.get('refs'))
+
+        if current:
+            transformer_options['minimax_h3_layout'] = layout
 
         shift_v = float(transformer_options.get('minimax_h3_sigma_shift_video', model.sigma_shift_video))
         shift_a = float(transformer_options.get('minimax_h3_sigma_shift_audio', model.sigma_shift_audio))
@@ -196,19 +226,23 @@ def make_forward(model, original_forward):
         blocks_replace = patches_replace.get('dit', {})
         prefetch_queue = comfy.model_prefetch.make_prefetch_queue(list(model.blocks), device, transformer_options)
         for i, block in enumerate(model.blocks):
-            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
+            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block, **prefetch_scope)
+            if current:
+                transformer_options['block_index'] = i
             if ('double_block', i) in blocks_replace:
                 def block_wrap(args):
+                    block_kwargs = {'attention': args.get('attention')} if current else {}
                     return {'img': block(args['img'], args['t_emb'], args['mod_segments'], args['rope_freqs'],
-                                         transformer_options=args['transformer_options'])}
-                h = blocks_replace[('double_block', i)](
-                    {'img': h, 't_emb': t_emb, 'mod_segments': mod_segments, 'rope_freqs': rope_freqs,
-                     'transformer_options': transformer_options},
-                    {'original_block': block_wrap})['img']
+                                         transformer_options=args['transformer_options'], **block_kwargs)}
+                block_args = {'img': h, 't_emb': t_emb, 'mod_segments': mod_segments, 'rope_freqs': rope_freqs,
+                              'transformer_options': transformer_options}
+                if current:
+                    block_args['layout'] = layout
+                h = blocks_replace[('double_block', i)](block_args, {'original_block': block_wrap})['img']
             else:
                 h = block(h, t_emb, mod_segments, rope_freqs, transformer_options=transformer_options)
-        if prefetch_queue is not None:
-            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
+        if current or prefetch_queue is not None:
+            comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None, **prefetch_scope)
 
         va, vb, _ = next(s for s in layout.segments if s[2] == 'video')
         aa, ab, _ = next(s for s in layout.segments if s[2] == 'audio')
@@ -220,7 +254,11 @@ def make_forward(model, original_forward):
             audio_seg = (aa, ab, rows_to_mod_index(audio_rows_t, 0) // 3)
         else:
             audio_seg = (aa, ab, t_row[seg_t['audio']])
-        v, a = model.final_layer(h, t_emb, video_seg, audio_seg)
+        if current:
+            v, a = model.final_layer(h, t_emb, video_seg, audio_seg, sigma_v, transformer_options.get('sample_sigmas'),
+                                     (shift_v, shift_a))
+        else:
+            v, a = model.final_layer(h, t_emb, video_seg, audio_seg)
 
         video_out = minimax.unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, model.latents_dim, model.patch_size)
         video_out = video_out[:, :, :orig_t, :orig_h, :orig_w]
@@ -256,15 +294,24 @@ def install(model_patcher, *, force_rebuild=False, strict=False):
                 'installed embedding-memory patch has no recoverable original'
             )
     else:
-        original = model._forward
+        original = unpatched_model_object(model_patcher, FORWARD_KEY, model._forward)
         if getattr(original, OWNER_MARKER, False):
             original = getattr(original, ORIGINAL_MARKER, None)
             if original is None:
                 raise H3EmbeddingMemoryPatchError(
                     'installed embedding-memory patch has no recoverable original'
                 )
+    if _upstream_releases_embedding(original):
+        if existing is not None:
+            model_patcher.object_patches.pop(FORWARD_KEY)
+        options = model_patcher.model_options['transformer_options'] = (
+            model_patcher.model_options.get('transformer_options', {}).copy()
+        )
+        options.pop(FALLBACK_REASON_KEY, None)
+        options['h3_sparse_dan_core_preserved_embedding_patch'] = False
+        return False
     try:
-        _validate_upstream_forward(original)
+        generation = _validate_upstream_forward(original)
     except H3EmbeddingMemoryPatchError as exc:
         if strict:
             raise
@@ -283,7 +330,7 @@ def install(model_patcher, *, force_rebuild=False, strict=False):
         options[FALLBACK_REASON_KEY] = reason
         options['h3_sparse_dan_core_preserved_embedding_patch'] = False
         return False
-    model_patcher.add_object_patch(FORWARD_KEY, make_forward(model, original))
+    model_patcher.add_object_patch(FORWARD_KEY, make_forward(model, original, generation))
     options = model_patcher.model_options['transformer_options'] = (
         model_patcher.model_options.get('transformer_options', {}).copy()
     )
@@ -295,6 +342,17 @@ def install(model_patcher, *, force_rebuild=False, strict=False):
 def is_installed(model_patcher):
     current = getattr(model_patcher, 'object_patches', {}).get(FORWARD_KEY)
     return bool(current is not None and getattr(current, OWNER_MARKER, False))
+
+
+def released_by_comfy(model_patcher):
+    '''True when ComfyUI's own H3 forward already releases early.'''
+    model = get_minimax_h3_model(model_patcher)
+    if model is None:
+        return False
+    original = unpatched_model_object(model_patcher, FORWARD_KEY, model._forward)
+    if getattr(original, OWNER_MARKER, False):
+        original = getattr(original, ORIGINAL_MARKER, None)
+    return original is not None and _upstream_releases_embedding(original)
 
 
 def clear(model_patcher):

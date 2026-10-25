@@ -13,7 +13,7 @@ from .plan import (
     DEFAULT_VIDEO_BUDGET,
     DEFAULT_VIDEO_TOKEN_ORDER,
     SPARSE_BACKEND_COMPAT_REQUESTS,
-    SPARSE_BACKEND_KITCHEN,
+    SPARSE_BACKEND_KITCHEN_64X32,
     SPARSE_BACKEND_PUBLIC_REQUESTS,
     SparseRequest,
     VIDEO_TOKEN_ORDER_REQUESTS,
@@ -157,13 +157,18 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
                     'backend',
                     display_name='Sparse backend',
                     options=list(SPARSE_BACKEND_PUBLIC_REQUESTS),
-                    default=SPARSE_BACKEND_KITCHEN,
+                    default=SPARSE_BACKEND_KITCHEN_64X32,
                     tooltip=(
-                        'Kitchen INT8 64Q x 64KV (Quality) is the default. '
+                        'Kitchen INT8 64Q x 32KV (Quality) is the default, using '
+                        'threshold routing when the native router is available. '
                         'Kitchen INT8 64Q x 128KV (Faster) was faster in the '
                         'measured full-block SM89 comparison, but its coarser '
                         'KV selections can change output quality and the speed '
                         'gain is not guaranteed on every GPU. '
+                        'Kitchen INT8 64Q x 32KV (Quality) routes finer '
+                        '32-token KV tiles over the same carrier: lower error '
+                        'at a given budget, measured faster than 64Q x 64KV '
+                        'at equal quality on SM89. '
                         'FROST BF16, BF16 Triton, and FP8 FlexAttention use '
                         '64Q x 64KV routing. Sparse Sage uses 128Q x 64KV on '
                         'SM80/86/87/89/120 and 64Q x 128KV on SM90. '
@@ -194,7 +199,7 @@ class H3SparseAttentionAdvanced(io.ComfyNode):
         protect_audio=True,
         curve_data=DEFAULT_CURVE_DATA,
         curve_profiles=DEFAULT_CURVE_PROFILES_DATA,
-        backend=SPARSE_BACKEND_KITCHEN,
+        backend=SPARSE_BACKEND_KITCHEN_64X32,
         video_token_order=DEFAULT_VIDEO_TOKEN_ORDER,
     ):
         passthrough = _vsa_passthrough(model)

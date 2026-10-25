@@ -12,13 +12,15 @@ The packaged native backends cover Windows x64. No other nodes from either upstr
 
 ## Source
 
-Advanced-related updates were synchronized against Zironic/H3-Optimizations **0.2.45**, commit [`8627749`](https://github.com/Zironic/H3-Optimizations/commit/862774944a331bc1a66cee1cf805b94bd138ebbe), checked 2026-10-17:
+Advanced-related updates were synchronized against Zironic/H3-Optimizations **0.2.46**, commit [`c6bc3cf`](https://github.com/Zironic/H3-Optimizations/commit/c6bc3cfc58c18c3a6220aeea09116e1eebd91669), checked 2026-10-25:
 
-- Sparse attention can replace recognized KJNodes SageAttention overrides, while preserving other custom attention overrides.
-- The fallback attention path honors newer ComfyUI per-block `comfy_attention` preferences and explicit attention callables.
-- Sparse Sage on SM89 can use the native SA2++ kernel shipped in the updated Windows DLL (`native-v11`, ABI 4). Older compatible libraries retain the existing extension fallback. SpargeAttention's compiled package is still required for the Sparse Sage backend.
+- Added **Kitchen INT8 64Q x 32KV (Quality)** as the default for new nodes, matching Advanced. The existing 64KV and 128KV choices remain available, and saved workflows keep their selected backend.
+- Kitchen uses native threshold routing when available, targeting the curve's budget with variable tile counts per query row. It falls back to the existing top-k router when the native threshold router is unavailable. Audio, text, reference context, and mixed boundary tiles stay dense.
+- Updated the Windows native library to `native-v19` / `h3_int8_attention_v9.dll` (ABI 4), including the finer 32KV route, packed sparse traversal, and device geometry self-checks.
+- Synced shared engine compatibility fixes, including stock-original capture when rebuilding a loaded model's patches, to prevent nested wrappers and repeated-run cube-order failures.
+- Retained recognized KJNodes SageAttention override replacement, ComfyUI per-block attention preferences, and native Sparse Sage SA2++ support on SM89. SpargeAttention's compiled package is still required for the Sparse Sage backend.
 
-Advanced has no new backend choices or input controls in this revision. The curve editor, profiles, step columns, step detection and refresh, curve visibility, and saved curve data are preserved.
+The backend dropdown now has seven choices. The curve editor, profiles, step columns, step detection and refresh, curve visibility, saved curve data, and workflow-loading fix are preserved. The frontend JavaScript is unchanged by this update.
 
 The sparse route keeps audio, text, reference context, and mixed boundary tiles dense by default. This node retains a hidden legacy workflow field for old graphs, but always enables that protection and no longer shows a toggle. VSA-trained H3 checkpoints pass through unchanged so their trained sparse route remains intact. The curve editor and workflow-saved profiles are this package's additions. Separate upstream nodes such as VSA Attention, Memory Optimization, and AIMDO Residency Limiter are not registered by this package.
 
